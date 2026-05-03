@@ -1,0 +1,17 @@
+{
+  "name": "Memory",
+  "short_name": "Memory",
+  "description": "노트북에서는 길게 쓰고, 모바일에서는 빠르게 남기는 로컬 우선 일기장",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f0e9",
+  "theme_color": "#f4f0e9",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
+
