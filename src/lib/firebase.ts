@@ -1,6 +1,7 @@
 import { initializeApp } from "firebase/app";
 import {
   getAuth,
+  getRedirectResult,
   GoogleAuthProvider,
   onAuthStateChanged,
   signInWithPopup,
@@ -13,6 +14,7 @@ import {
   persistentLocalCache,
   persistentMultipleTabManager,
 } from "firebase/firestore";
+import { getStorage } from "firebase/storage";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -35,6 +37,10 @@ export const firebaseApp = isFirebaseConfigured ? initializeApp(firebaseConfig) 
 
 export const firebaseAuth = firebaseApp ? getAuth(firebaseApp) : undefined;
 
+export const isFirebaseStorageConfigured = Boolean(isFirebaseConfigured && firebaseConfig.storageBucket);
+
+export const firebaseStorage = firebaseApp && firebaseConfig.storageBucket ? getStorage(firebaseApp) : undefined;
+
 export const firestoreDb = firebaseApp
   ? initializeFirestore(firebaseApp, {
       localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
@@ -43,10 +49,6 @@ export const firestoreDb = firebaseApp
 
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
-
-function prefersRedirectSignIn(): boolean {
-  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-}
 
 export function subscribeAuth(callback: (user: User | null) => void): () => void {
   if (!firebaseAuth) {
@@ -57,21 +59,26 @@ export function subscribeAuth(callback: (user: User | null) => void): () => void
   return onAuthStateChanged(firebaseAuth, callback);
 }
 
+export async function completeRedirectSignIn(): Promise<User | null> {
+  if (!firebaseAuth) return null;
+  const result = await getRedirectResult(firebaseAuth);
+  return result?.user ?? firebaseAuth.currentUser;
+}
+
 export async function signInWithGoogle(): Promise<void> {
   if (!firebaseAuth) {
     throw new Error("Firebase is not configured.");
-  }
-
-  if (prefersRedirectSignIn()) {
-    await signInWithRedirect(firebaseAuth, googleProvider);
-    return;
   }
 
   try {
     await signInWithPopup(firebaseAuth, googleProvider);
   } catch (error) {
     const code = typeof error === "object" && error && "code" in error ? String(error.code) : "";
-    if (code.includes("popup") || code.includes("cancelled")) {
+    if (
+      code.includes("popup-blocked") ||
+      code.includes("operation-not-supported") ||
+      code.includes("web-storage-unsupported")
+    ) {
       await signInWithRedirect(firebaseAuth, googleProvider);
       return;
     }
@@ -83,4 +90,3 @@ export async function signOutFromGoogle(): Promise<void> {
   if (!firebaseAuth) return;
   await signOut(firebaseAuth);
 }
-

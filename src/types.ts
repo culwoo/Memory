@@ -1,4 +1,13 @@
-export type MoodId = "clear" | "good" | "tired" | "heavy" | "angry" | "quiet";
+export type MoodId =
+  | "clear"
+  | "good"
+  | "excited"
+  | "warm"
+  | "focused"
+  | "quiet"
+  | "tired"
+  | "heavy"
+  | "angry";
 
 export interface AttachmentMeta {
   id: string;
@@ -6,6 +15,8 @@ export interface AttachmentMeta {
   type: string;
   size: number;
   thumbnail?: string;
+  storagePath?: string;
+  uploadState?: "local" | "uploading" | "uploaded" | "failed";
   createdAt: string;
 }
 
@@ -39,4 +50,3 @@ export interface AppSettings {
 }
 
 export type SaveState = "idle" | "dirty" | "saving" | "saved" | "error";
-

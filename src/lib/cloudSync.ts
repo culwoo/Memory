@@ -71,14 +71,16 @@ function compactObject<T extends Record<string, unknown>>(value: T): Partial<T> 
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as Partial<T>;
 }
 
+type CloudAttachmentPayload = Partial<JournalEntry["attachments"][number]> & {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  createdAt: string;
+};
+
 type CloudEntryPayload = Partial<Omit<JournalEntry, "attachments">> & {
-  attachments: Array<{
-    id: string;
-    name: string;
-    type: string;
-    size: number;
-    createdAt: string;
-  }>;
+  attachments: CloudAttachmentPayload[];
 };
 
 function serializeEntryForCloud(entry: JournalEntry): CloudEntryPayload {
@@ -90,13 +92,16 @@ function serializeEntryForCloud(entry: JournalEntry): CloudEntryPayload {
     mood: entry.mood,
     activityTags: entry.activityTags,
     tags: entry.tags,
-    attachments: entry.attachments.map((attachment) => ({
+    attachments: entry.attachments.map((attachment) => compactObject({
         id: attachment.id,
         name: attachment.name,
         type: attachment.type,
         size: attachment.size,
+        thumbnail: attachment.thumbnail,
+        storagePath: attachment.storagePath,
+        uploadState: attachment.uploadState,
         createdAt: attachment.createdAt,
-      })),
+      }) as CloudAttachmentPayload),
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     deletedAt: entry.deletedAt,

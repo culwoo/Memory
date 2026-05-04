@@ -1,0 +1,10 @@
+.env
+.env.*
+.git
+.vercel
+node_modules
+dist
+.playwright-mcp
+screenshots
+*.log
+*.tmp

@@ -104,6 +104,29 @@ export async function getAttachmentsForEntry(entryId: string): Promise<Attachmen
   return requestToPromise<AttachmentRecord[]>(index.getAll(entryId));
 }
 
+export async function deleteAttachmentsForEntry(entryId: string): Promise<void> {
+  const records = await getAttachmentsForEntry(entryId);
+  if (!records.length) return;
+
+  const db = await openMemoryDb();
+  const tx = db.transaction(ATTACHMENT_STORE, "readwrite");
+  const store = tx.objectStore(ATTACHMENT_STORE);
+  records.forEach((record) => store.delete(record.id));
+  await txDone(tx);
+}
+
+export async function clearLocalJournalData(): Promise<void> {
+  const db = await openMemoryDb();
+  const tx = db.transaction([ENTRY_STORE, ATTACHMENT_STORE, META_STORE], "readwrite");
+  tx.objectStore(ENTRY_STORE).clear();
+  tx.objectStore(ATTACHMENT_STORE).clear();
+  const metaStore = tx.objectStore(META_STORE);
+  metaStore.delete("tagLibrary");
+  metaStore.delete("lastSyncUserId");
+  metaStore.delete("lastLocalSaveAt");
+  await txDone(tx);
+}
+
 export async function getSettings(): Promise<AppSettings> {
   const db = await openMemoryDb();
   const tx = db.transaction(META_STORE, "readonly");

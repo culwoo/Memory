@@ -6,16 +6,20 @@ import {
   ChevronRight,
   Cloud,
   Frown,
+  Heart,
   ImagePlus,
   Info,
   Laugh,
   Meh,
   Moon,
+  PartyPopper,
   Plus,
   Search,
   SlidersHorizontal,
   Smile,
   Sun,
+  Target,
+  Trash2,
   X,
 } from "lucide-react";
 import type { ReactElement } from "react";
@@ -31,10 +35,11 @@ import {
   todayKey,
 } from "./lib/date";
 import {
-  getEntries,
+  clearLocalJournalData,
   getAllEntries,
   getMetaValue,
   getSettings,
+  deleteAttachmentsForEntry,
   saveAttachment,
   saveEntry,
   saveSettings,
@@ -49,7 +54,9 @@ import {
   syncEntriesWithCloud,
   syncTagLibraryWithCloud,
 } from "./lib/cloudSync";
+import { deleteAttachmentFiles, uploadAttachmentFile } from "./lib/cloudStorage";
 import {
+  completeRedirectSignIn,
   isFirebaseConfigured,
   signInWithGoogle,
   signOutFromGoogle,
@@ -71,6 +78,9 @@ interface MoodOption {
 const MOODS: MoodOption[] = [
   { id: "clear", label: "맑음", tone: "mood-clear", icon: Smile },
   { id: "good", label: "좋음", tone: "mood-good", icon: Laugh },
+  { id: "excited", label: "신남", tone: "mood-excited", icon: PartyPopper },
+  { id: "warm", label: "따뜻함", tone: "mood-warm", icon: Heart },
+  { id: "focused", label: "집중", tone: "mood-focused", icon: Target },
   { id: "quiet", label: "고요", tone: "mood-quiet", icon: Cloud },
   { id: "tired", label: "피곤", tone: "mood-tired", icon: Meh },
   { id: "heavy", label: "무거움", tone: "mood-heavy", icon: Frown },
@@ -82,6 +92,14 @@ const NAV_ITEMS: Array<{ id: PrimaryViewId; icon: typeof BookOpen }> = [
   { id: "calendar", icon: CalendarDays },
   { id: "search", icon: Search },
 ];
+
+const DRAFT_SHADOW_KEY = "memory-draft-shadow-v1";
+
+interface DraftShadow {
+  userId: string;
+  entry: JournalEntry;
+  savedAt: string;
+}
 
 function createId(prefix: string): string {
   return `${prefix}-${crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`}`;
@@ -130,7 +148,82 @@ function uniqueTags(values: string[]): string[] {
   return Array.from(new Set(values.map((tag) => tag.trim().replace(/^#/, "")).filter(Boolean))).slice(0, 60);
 }
 
+function readDraftShadow(userId: string): DraftShadow | null {
+  try {
+    const raw = localStorage.getItem(DRAFT_SHADOW_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as DraftShadow;
+    if (parsed.userId !== userId || !parsed.entry || !hasEntryContent(parsed.entry)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeDraftShadow(userId: string | undefined, entry: JournalEntry): void {
+  if (!userId) return;
+
+  try {
+    if (!hasEntryContent(entry)) {
+      clearDraftShadow(userId, entry.id);
+      return;
+    }
+
+    const savedAt = new Date().toISOString();
+    const payload: DraftShadow = {
+        userId,
+        savedAt,
+        entry: {
+          ...entry,
+          updatedAt: savedAt,
+        },
+      };
+
+    try {
+      localStorage.setItem(DRAFT_SHADOW_KEY, JSON.stringify(payload));
+    } catch {
+      localStorage.setItem(
+        DRAFT_SHADOW_KEY,
+        JSON.stringify({
+          ...payload,
+          entry: {
+            ...payload.entry,
+            attachments: payload.entry.attachments.map((attachment) => ({
+              ...attachment,
+              thumbnail: undefined,
+            })),
+          },
+        } satisfies DraftShadow)
+      );
+    }
+  } catch {
+    // IndexedDB autosave still runs; this shadow only protects abrupt reloads.
+  }
+}
+
+function clearDraftShadow(userId?: string, entryId?: string): void {
+  try {
+    const raw = localStorage.getItem(DRAFT_SHADOW_KEY);
+    if (!raw) return;
+    if (!userId && !entryId) {
+      localStorage.removeItem(DRAFT_SHADOW_KEY);
+      return;
+    }
+
+    const parsed = JSON.parse(raw) as DraftShadow;
+    if ((!userId || parsed.userId === userId) && (!entryId || parsed.entry?.id === entryId)) {
+      localStorage.removeItem(DRAFT_SHADOW_KEY);
+    }
+  } catch {
+    localStorage.removeItem(DRAFT_SHADOW_KEY);
+  }
+}
+
 function syncErrorMessage(error: unknown): string {
+  if (error == null) {
+    return "작업을 완료하지 못했습니다. 로컬 저장소 또는 네트워크 상태를 확인하세요.";
+  }
+
   const code = typeof error === "object" && error && "code" in error ? String(error.code) : "";
   const message = typeof error === "object" && error && "message" in error ? String(error.message) : "";
 
@@ -150,7 +243,46 @@ function syncErrorMessage(error: unknown): string {
     return "Firestore 설정이 완료되지 않았습니다. 데이터베이스 생성 상태와 Rules 게시 상태를 확인하세요.";
   }
 
+  if (code.includes("storage/unauthorized")) {
+    return "사진 저장소 권한이 거부됐습니다. Firebase Storage Rules가 users/{uid} 아래만 허용하도록 게시됐는지 확인하세요.";
+  }
+
+  if (code.includes("storage/bucket-not-found")) {
+    return "Firebase Storage 버킷을 찾지 못했습니다. Firebase 콘솔에서 Storage가 생성됐는지 확인하세요.";
+  }
+
+  if (code.includes("storage/")) {
+    return `사진 동기화 실패 (${code})${message ? `: ${message}` : ""}`;
+  }
+
+  if (message.includes("Firebase Storage")) {
+    return `사진 동기화 실패: ${message}`;
+  }
+
   return `Firestore 동기화 실패${code ? ` (${code})` : ""}${message ? `: ${message}` : ""}`;
+}
+
+function authErrorMessage(error: unknown): string {
+  const code = typeof error === "object" && error && "code" in error ? String(error.code) : "";
+  const message = typeof error === "object" && error && "message" in error ? String(error.message) : "";
+
+  if (code.includes("unauthorized-domain")) {
+    return "현재 배포 도메인이 Firebase Auth 승인 도메인에 없습니다. Firebase Authentication 설정에서 memory-two-steel.vercel.app을 추가하세요.";
+  }
+
+  if (code.includes("operation-not-allowed")) {
+    return "Google 로그인 제공업체가 꺼져 있습니다. Firebase Authentication의 로그인 방법에서 Google을 활성화하세요.";
+  }
+
+  if (code.includes("popup-closed-by-user") || code.includes("cancelled-popup-request")) {
+    return "Google 로그인 창이 닫혔습니다. 다시 시도해 주세요.";
+  }
+
+  if (code.includes("network-request-failed")) {
+    return "네트워크 문제로 Google 로그인을 시작하지 못했습니다.";
+  }
+
+  return `Google 로그인을 시작하지 못했습니다${code ? ` (${code})` : ""}${message ? `: ${message}` : ""}`;
 }
 
 async function makeThumbnail(file: File): Promise<string | undefined> {
@@ -158,7 +290,7 @@ async function makeThumbnail(file: File): Promise<string | undefined> {
 
   try {
     const bitmap = await createImageBitmap(file);
-    const maxSize = 520;
+    const maxSize = 360;
     const ratio = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height));
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(bitmap.width * ratio));
@@ -166,7 +298,7 @@ async function makeThumbnail(file: File): Promise<string | undefined> {
     const context = canvas.getContext("2d");
     context?.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
     bitmap.close();
-    return canvas.toDataURL("image/jpeg", 0.78);
+    return canvas.toDataURL("image/jpeg", 0.72);
   } catch {
     return new Promise((resolve) => {
       const reader = new FileReader();
@@ -188,7 +320,8 @@ function App() {
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [filterTags, setFilterTags] = useState<string[]>([]);
-  const [filterMoods, setFilterMoods] = useState<MoodId[]>([]);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [authReady, setAuthReady] = useState(!isFirebaseConfigured);
   const [syncUser, setSyncUser] = useState<User | null>(null);
   const [syncError, setSyncError] = useState<string | null>(() =>
@@ -203,13 +336,35 @@ function App() {
     syncEnabled: false,
   });
   const [tagLibrary, setTagLibrary] = useState<string[]>([]);
+  const draftRef = useRef(draft);
   const currentDateRef = useRef(currentDate);
   const dirtyRef = useRef(dirty);
   const syncUserRef = useRef<User | null>(syncUser);
   const tagLibraryRef = useRef<string[]>(tagLibrary);
 
-  const entryByDate = useMemo(() => new Map(entries.map((entry) => [entry.date, entry])), [entries]);
+  const entryByDate = useMemo(() => {
+    const map = new Map(entries.map((entry) => [entry.date, entry]));
+    if (hasEntryContent(draft)) {
+      map.set(draft.date, draft);
+    }
+    return map;
+  }, [entries, draft]);
   const activeMood = MOODS.find((mood) => mood.id === draft.mood);
+
+  const resetVisibleJournal = useCallback((date: string = todayKey()) => {
+    const emptyEntry = createEmptyEntry(date);
+    setEntries([]);
+    setTagLibrary([]);
+    setCurrentDate(date);
+    draftRef.current = emptyEntry;
+    setDraft(emptyEntry);
+    setDirty(false);
+    setSaveState("idle");
+  }, []);
+
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
 
   useEffect(() => {
     currentDateRef.current = currentDate;
@@ -236,27 +391,25 @@ function App() {
     });
   }, []);
 
-  const loadDraftForDate = useCallback(
-    (date: string, nextView: ViewId = "today") => {
-      const existing = entryByDate.get(date);
-      setCurrentDate(date);
-      setDraft(existing ?? createEmptyEntry(date));
-      setDirty(false);
-      setSaveState(existing ? "saved" : "idle");
-      setView(nextView);
-    },
-    [entryByDate]
-  );
 
-  const updateDraft = useCallback((updater: (entry: JournalEntry) => JournalEntry) => {
-    setDraft((previous) => updater(previous));
+  const commitDraft = useCallback((updater: (entry: JournalEntry) => JournalEntry): JournalEntry => {
+    const nextDraft = updater(draftRef.current);
+    draftRef.current = nextDraft;
+    setDraft(nextDraft);
     setDirty(true);
     setSaveState("dirty");
+    writeDraftShadow(syncUserRef.current?.uid, nextDraft);
+    return nextDraft;
   }, []);
 
+  const updateDraft = useCallback((updater: (entry: JournalEntry) => JournalEntry) => {
+    commitDraft(updater);
+  }, [commitDraft]);
+
   const persistDraft = useCallback(
-    async (entry: JournalEntry = draft) => {
-      if (!hasEntryContent(entry)) {
+    async (entry?: JournalEntry) => {
+      const sourceEntry = entry ?? draftRef.current;
+      if (!hasEntryContent(sourceEntry)) {
         setSaveState("idle");
         return;
       }
@@ -264,13 +417,15 @@ function App() {
       setSaveState("saving");
       const now = new Date().toISOString();
       const nextEntry: JournalEntry = {
-        ...entry,
+        ...sourceEntry,
         updatedAt: now,
-        version: entry.version + 1,
+        version: sourceEntry.version + 1,
       };
 
       try {
         await saveEntry(nextEntry);
+        clearDraftShadow(syncUserRef.current?.uid, nextEntry.id);
+        draftRef.current = nextEntry;
         setDraft(nextEntry);
         setEntries((previous) => {
           const withoutCurrent = previous.filter((item) => item.id !== nextEntry.id && item.date !== nextEntry.date);
@@ -287,30 +442,50 @@ function App() {
         setSaveState("error");
       }
     },
-    [draft]
+    []
+  );
+
+  const loadDraftForDate = useCallback(
+    (date: string, nextView: ViewId = "today") => {
+      if (draftRef.current.date === date) {
+        setView(nextView);
+        return;
+      }
+
+      if (dirtyRef.current) {
+        void persistDraft();
+      }
+
+      const existing = entryByDate.get(date);
+      setCurrentDate(date);
+      const nextDraft = existing ?? createEmptyEntry(date);
+      draftRef.current = nextDraft;
+      setDraft(nextDraft);
+      setDirty(false);
+      setSaveState(existing ? "saved" : "idle");
+      setView(nextView);
+    },
+    [entryByDate, persistDraft]
+  );
+
+  const handleViewChange = useCallback(
+    (nextView: ViewId) => {
+      if (view === "today" && nextView !== "today" && dirtyRef.current) {
+        void persistDraft();
+      }
+      setView(nextView);
+    },
+    [view, persistDraft]
   );
 
   useEffect(() => {
     let active = true;
 
-    Promise.all([
-      getEntries(),
-      getSettings(),
-      getMetaValue<string[]>("tagLibrary"),
-    ]).then(
-      ([storedEntries, storedSettings, storedTagLibrary]) => {
-        if (!active) return;
-        setEntries(storedEntries);
-        setSettingsState(storedSettings);
-        document.documentElement.dataset.theme = storedSettings.theme;
-        const entryTags = storedEntries.flatMap((entry) => [...entry.tags, ...entry.activityTags]);
-        setTagLibrary(uniqueTags([...(storedTagLibrary ?? []), ...entryTags]));
-
-        const existing = storedEntries.find((entry) => entry.date === todayKey());
-        setDraft(existing ?? createEmptyEntry(todayKey()));
-        setSaveState(existing ? "saved" : "idle");
-      }
-    );
+    getSettings().then((storedSettings) => {
+      if (!active) return;
+      setSettingsState(storedSettings);
+      document.documentElement.dataset.theme = storedSettings.theme;
+    });
 
     return () => {
       active = false;
@@ -320,12 +495,46 @@ function App() {
   useEffect(() => {
     if (!isFirebaseConfigured) return undefined;
 
-    return subscribeAuth((user) => {
-      setSyncUser(user);
-      setAuthReady(true);
-      if (user) setSyncError(null);
-    });
-  }, []);
+    let active = true;
+    let unsubscribe: () => void = () => undefined;
+
+    async function startAuth() {
+      try {
+        await completeRedirectSignIn();
+      } catch (error) {
+        if (active) setSyncError(authErrorMessage(error));
+      }
+
+      if (!active) return;
+
+      unsubscribe = subscribeAuth((user) => {
+        if ((syncUserRef.current?.uid ?? null) !== (user?.uid ?? null)) {
+          const shadow = user ? readDraftShadow(user.uid) : null;
+          if (shadow) {
+            setEntries([]);
+            setTagLibrary([]);
+            setCurrentDate(shadow.entry.date);
+            draftRef.current = shadow.entry;
+            setDraft(shadow.entry);
+            setDirty(true);
+            setSaveState("dirty");
+          } else {
+            resetVisibleJournal();
+          }
+        }
+        setSyncUser(user);
+        setAuthReady(true);
+        if (user) setSyncError(null);
+      });
+    }
+
+    void startAuth();
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [resetVisibleJournal]);
 
   useEffect(() => {
     if (!syncUser) return undefined;
@@ -337,17 +546,38 @@ function App() {
 
     async function startSync() {
       try {
-        const [localEntries, storedTagLibrary] = await Promise.all([
+        let [localEntries, storedTagLibrary] = await Promise.all([
           getAllEntries(),
           getMetaValue<string[]>("tagLibrary"),
         ]);
         const lastSyncUserId = await getMetaValue<string>("lastSyncUserId");
         if (lastSyncUserId && lastSyncUserId !== userId) {
-          setSyncError("이 기기에는 다른 Google 계정의 로컬 일기가 있습니다. 계정을 확인한 뒤 다시 로그인하세요.");
-          void signOutFromGoogle();
-          return;
+          await clearLocalJournalData();
+          clearDraftShadow(lastSyncUserId);
+          if (!active) return;
+          localEntries = [];
+          storedTagLibrary = [];
+          resetVisibleJournal(currentDateRef.current);
         }
-        void setMetaValue("lastSyncUserId", userId);
+        await setMetaValue("lastSyncUserId", userId);
+
+        const shadow = readDraftShadow(userId);
+        if (shadow) {
+          const shadowEntry: JournalEntry = {
+            ...shadow.entry,
+            updatedAt: shadow.savedAt,
+            version: shadow.entry.version + 1,
+          };
+          const withoutShadowDate = localEntries.filter((entry) => entry.date !== shadowEntry.date);
+          localEntries = sortEntries([shadowEntry, ...withoutShadowDate]);
+          await saveEntry(shadowEntry);
+          if (!active) return;
+          setCurrentDate(shadowEntry.date);
+          draftRef.current = shadowEntry;
+          setDraft(shadowEntry);
+          setDirty(true);
+          setSaveState("dirty");
+        }
 
         const mergedEntries = await syncEntriesWithCloud(userId, localEntries);
         if (!active) return;
@@ -357,7 +587,9 @@ function App() {
         setEntries(visibleEntries);
         setDraft((previous) => {
           if (dirtyRef.current) return previous;
-          return visibleEntries.find((entry) => entry.date === currentDateRef.current) ?? previous;
+          const nextDraft = visibleEntries.find((entry) => entry.date === currentDateRef.current) ?? previous;
+          draftRef.current = nextDraft;
+          return nextDraft;
         });
 
         const localTags = uniqueTags([
@@ -383,7 +615,9 @@ function App() {
             setEntries(nextVisibleEntries);
             setDraft((previous) => {
               if (dirtyRef.current) return previous;
-              return nextVisibleEntries.find((entry) => entry.date === currentDateRef.current) ?? previous;
+              const nextDraft = nextVisibleEntries.find((entry) => entry.date === currentDateRef.current) ?? previous;
+              draftRef.current = nextDraft;
+              return nextDraft;
             });
           },
           (error) => setSyncError(syncErrorMessage(error))
@@ -412,7 +646,7 @@ function App() {
       unsubscribeEntries?.();
       unsubscribeTags?.();
     };
-  }, [syncUser]);
+  }, [resetVisibleJournal, syncUser]);
 
   useEffect(() => {
     if (!dirty || !settings.autoSaveEnabled) return undefined;
@@ -437,20 +671,19 @@ function App() {
 
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setView("search");
+        handleViewChange("search");
         window.setTimeout(() => document.getElementById("search-input")?.focus(), 0);
       }
     };
 
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [persistDraft]);
+  }, [persistDraft, handleViewChange]);
 
   const searchResults = useMemo(() => {
     const hasTextQuery = !!debouncedQuery;
     const hasTagFilter = filterTags.length > 0;
-    const hasMoodFilter = filterMoods.length > 0;
-    const hasAnyFilter = hasTextQuery || hasTagFilter || hasMoodFilter;
+    const hasAnyFilter = hasTextQuery || hasTagFilter;
 
     if (!hasAnyFilter) return entries.slice(0, 20);
 
@@ -469,12 +702,9 @@ function App() {
         const entryTags = [...entry.tags, ...entry.activityTags];
         if (!filterTags.some((tag) => entryTags.includes(tag))) return false;
       }
-      if (hasMoodFilter) {
-        if (!entry.mood || !filterMoods.includes(entry.mood)) return false;
-      }
       return true;
     });
-  }, [debouncedQuery, entries, filterTags, filterMoods]);
+  }, [debouncedQuery, entries, filterTags]);
 
   const calendarDays = useMemo(() => getCalendarDays(monthCursor), [monthCursor]);
 
@@ -482,6 +712,7 @@ function App() {
     if (!files?.length) return;
 
     for (const file of Array.from(files).slice(0, 6)) {
+      const user = syncUserRef.current;
       const id = createId("attachment");
       const thumbnail = await makeThumbnail(file);
       const createdAt = new Date().toISOString();
@@ -491,15 +722,44 @@ function App() {
         type: file.type,
         size: file.size,
         thumbnail,
+        uploadState: user ? "uploading" : "local",
         createdAt,
       };
       const record: AttachmentRecord = {
         ...meta,
-        entryId: draft.id,
+        entryId: draftRef.current.id,
         blob: file,
       };
       await saveAttachment(record);
-      updateDraft((entry) => ({ ...entry, attachments: [...entry.attachments, meta] }));
+      const entryWithAttachment = commitDraft((entry) => ({ ...entry, attachments: [...entry.attachments, meta] }));
+
+      if (!user) continue;
+
+      try {
+        const storagePath = await uploadAttachmentFile(user.uid, entryWithAttachment.date, id, file);
+        if (draftRef.current.id !== entryWithAttachment.id) {
+          await deleteAttachmentFiles([{ ...meta, storagePath, uploadState: "uploaded" }]);
+          continue;
+        }
+
+        const uploadedEntry = commitDraft((entry) => ({
+          ...entry,
+          attachments: entry.attachments.map((attachment) =>
+            attachment.id === id ? { ...attachment, storagePath, uploadState: "uploaded" } : attachment
+          ),
+        }));
+        void persistDraft(uploadedEntry);
+      } catch (error) {
+        if (draftRef.current.id === entryWithAttachment.id) {
+          commitDraft((entry) => ({
+            ...entry,
+            attachments: entry.attachments.map((attachment) =>
+              attachment.id === id ? { ...attachment, uploadState: "failed" } : attachment
+            ),
+          }));
+        }
+        setSyncError(syncErrorMessage(error));
+      }
     }
   }
 
@@ -538,26 +798,56 @@ function App() {
   }
 
   async function handleDeleteCurrent() {
-    if (!hasEntryContent(draft)) return;
-    const confirmed = window.confirm("현재 기록을 휴지통으로 이동할까요?");
-    if (!confirmed) return;
+    const entryToDelete = draftRef.current;
+    if (!hasEntryContent(entryToDelete)) return;
     const now = new Date().toISOString();
     const deletedEntry: JournalEntry = {
-      ...draft,
+      ...entryToDelete,
       deletedAt: now,
       updatedAt: now,
-      version: draft.version + 1,
+      version: entryToDelete.version + 1,
     };
     await saveEntry(deletedEntry);
-    if (syncUserRef.current) {
-      void pushEntryToCloud(syncUserRef.current.uid, deletedEntry).catch((error) => {
+
+    const user = syncUserRef.current;
+    let cloudDeleteSynced = false;
+    if (user) {
+      try {
+        await pushEntryToCloud(user.uid, deletedEntry);
+        cloudDeleteSynced = true;
+      } catch (error) {
         setSyncError(syncErrorMessage(error));
-      });
+      }
     }
-    setEntries((previous) => previous.filter((entry) => entry.id !== draft.id));
-    setDraft(createEmptyEntry(currentDate));
+
+    if (user && cloudDeleteSynced && entryToDelete.attachments.length > 0) {
+      try {
+        await deleteAttachmentFiles(entryToDelete.attachments);
+      } catch (error) {
+        setSyncError(syncErrorMessage(error));
+      }
+    }
+
+    await deleteAttachmentsForEntry(entryToDelete.id);
+    setEntries((previous) => previous.filter((entry) => entry.id !== entryToDelete.id));
+    const emptyEntry = createEmptyEntry(currentDate);
+    draftRef.current = emptyEntry;
+    setDraft(emptyEntry);
     setDirty(false);
     setSaveState("idle");
+  }
+
+  async function handleConfirmDeleteCurrent() {
+    if (deleteBusy) return;
+    setDeleteBusy(true);
+    try {
+      await handleDeleteCurrent();
+      setDeleteConfirmOpen(false);
+    } catch (error) {
+      setSyncError(syncErrorMessage(error));
+    } finally {
+      setDeleteBusy(false);
+    }
   }
 
   const content = {
@@ -566,13 +856,14 @@ function App() {
         draft={draft}
         activeMood={activeMood}
         currentDate={currentDate}
+        canDelete={hasEntryContent(draft)}
         tagLibrary={tagLibrary}
         onDraftChange={updateDraft}
         onFiles={handleFiles}
         onAddTag={handleAddTag}
         onToggleTag={handleToggleTag}
         onDeleteTag={handleDeleteTag}
-        onDelete={() => void handleDeleteCurrent()}
+        onDelete={() => setDeleteConfirmOpen(true)}
       />
     ),
     calendar: (
@@ -590,10 +881,8 @@ function App() {
         results={searchResults}
         allTags={tagLibrary}
         filterTags={filterTags}
-        filterMoods={filterMoods}
         onQueryChange={setQuery}
         onToggleTagFilter={(tag) => setFilterTags((prev) => prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag])}
-        onToggleMoodFilter={(mood) => setFilterMoods((prev) => prev.includes(mood) ? prev.filter((m) => m !== mood) : [...prev, mood])}
         onSelectEntry={(entry) => loadDraftForDate(entry.date)}
       />
     ),
@@ -612,13 +901,13 @@ function App() {
     try {
       setSyncError(null);
       await signInWithGoogle();
-    } catch {
-      setSyncError("Google 로그인을 시작하지 못했습니다. Firebase Auth 설정을 확인하세요.");
+    } catch (error) {
+      setSyncError(authErrorMessage(error));
     }
   }
 
   if (!authReady) {
-    return <LoginScreen mode="loading" />;
+    return <AuthLoadingScreen />;
   }
 
   if (!syncUser) {
@@ -640,7 +929,7 @@ function App() {
               key={item.id}
               className={`nav-button ${view === item.id ? "is-active" : ""}`}
               type="button"
-              onClick={() => setView(item.id)}
+              onClick={() => handleViewChange(item.id)}
               aria-label={item.id}
             >
               <item.icon aria-hidden="true" />
@@ -651,7 +940,7 @@ function App() {
         <button
           className={`account-button ${view === "profile" ? "is-active" : ""}`}
           type="button"
-          onClick={() => setView("profile")}
+          onClick={() => handleViewChange("profile")}
           aria-label="나의 페이지"
           title={syncUser.email ?? "나의 페이지"}
         >
@@ -670,8 +959,25 @@ function App() {
 
       <main className="main-panel">{content[view]}</main>
 
-      <MobileAccountButton user={syncUser} isActive={view === "profile"} onClick={() => setView("profile")} />
-      <MobileNav current={view} onChange={setView} />
+      {deleteConfirmOpen ? (
+        <DeleteEntryDialog
+          date={currentDate}
+          isBusy={deleteBusy}
+          onCancel={() => setDeleteConfirmOpen(false)}
+          onConfirm={() => void handleConfirmDeleteCurrent()}
+        />
+      ) : null}
+
+      <MobileAccountButton
+        user={syncUser}
+        isProfileActive={view === "profile"}
+        onClick={() => handleViewChange("profile")}
+      />
+      <MobileThemeButton
+        theme={settings.theme}
+        onClick={() => updateSettings({ theme: settings.theme === "light" ? "dark" : "light" })}
+      />
+      <MobileNav current={view} onChange={handleViewChange} />
     </div>
   );
 }
@@ -714,6 +1020,67 @@ function LoginScreen({
         {error ? <span className="login-error">{error}</span> : null}
       </section>
     </main>
+  );
+}
+
+function AuthLoadingScreen() {
+  return (
+    <main className="auth-loading-shell" aria-label="로그인 상태 확인">
+      <div className="auth-loading-mark">
+        <BookOpen aria-hidden="true" />
+      </div>
+    </main>
+  );
+}
+
+function DeleteEntryDialog({
+  date,
+  isBusy,
+  onCancel,
+  onConfirm,
+}: {
+  date: string;
+  isBusy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEffect(() => {
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !isBusy) onCancel();
+    };
+
+    window.addEventListener("keydown", handleKeydown);
+    return () => window.removeEventListener("keydown", handleKeydown);
+  }, [isBusy, onCancel]);
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={() => !isBusy && onCancel()}>
+      <div
+        className="delete-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="delete-dialog-title"
+        aria-describedby="delete-dialog-description"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="delete-dialog-mark">
+          <Trash2 aria-hidden="true" />
+        </div>
+        <h2 id="delete-dialog-title">이 일기를 삭제할까요?</h2>
+        <p id="delete-dialog-description">
+          {formatKoreanDate(date)} 기록은 이 기기와 동기화된 기기에서 보이지 않아요.
+        </p>
+        <div className="delete-dialog-actions">
+          <button className="dialog-action secondary" type="button" onClick={onCancel} disabled={isBusy}>
+            취소
+          </button>
+          <button className="dialog-action danger" type="button" onClick={onConfirm} disabled={isBusy}>
+            <Trash2 aria-hidden="true" />
+            {isBusy ? "삭제 중" : "삭제"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -770,6 +1137,7 @@ function TodayView({
   draft,
   activeMood,
   currentDate,
+  canDelete,
   tagLibrary,
   onDraftChange,
   onFiles,
@@ -781,6 +1149,7 @@ function TodayView({
   draft: JournalEntry;
   activeMood?: MoodOption;
   currentDate: string;
+  canDelete: boolean;
   tagLibrary: string[];
   onDraftChange: (updater: (entry: JournalEntry) => JournalEntry) => void;
   onFiles: (files: FileList | null) => void;
@@ -820,8 +1189,15 @@ function TodayView({
 
         <footer className="editor-footer">
           <span>{charCount.toLocaleString("ko-KR")}자</span>
-          <button className="text-button danger" type="button" onClick={onDelete}>
-            기록 비우기
+          <button
+            className="icon-button delete-entry-button"
+            type="button"
+            onClick={onDelete}
+            disabled={!canDelete}
+            aria-label="일기 삭제"
+            title="일기 삭제"
+          >
+            <Trash2 aria-hidden="true" />
           </button>
         </footer>
       </section>
@@ -879,8 +1255,15 @@ function TodayView({
           {draft.attachments.length > 0 ? (
             <div className="attachment-grid">
               {draft.attachments.map((item) => (
-                <figure key={item.id}>
+                <figure key={item.id} className={`attachment-card ${item.uploadState ? `is-${item.uploadState}` : ""}`}>
                   {item.thumbnail ? <img src={item.thumbnail} alt="" /> : <div className="file-thumb" />}
+                  {item.uploadState === "uploading" || item.uploadState === "failed" ? (
+                    <span
+                      className="attachment-state"
+                      aria-label={item.uploadState === "uploading" ? "사진 업로드 중" : "사진 업로드 실패"}
+                      title={item.uploadState === "uploading" ? "사진 업로드 중" : "사진 업로드 실패"}
+                    />
+                  ) : null}
                   <figcaption>{item.name}</figcaption>
                 </figure>
               ))}
@@ -1107,52 +1490,48 @@ function SearchView({
   results,
   allTags,
   filterTags,
-  filterMoods,
   onQueryChange,
   onToggleTagFilter,
-  onToggleMoodFilter,
   onSelectEntry,
 }: {
   query: string;
   results: JournalEntry[];
   allTags: string[];
   filterTags: string[];
-  filterMoods: MoodId[];
   onQueryChange: (value: string) => void;
   onToggleTagFilter: (tag: string) => void;
-  onToggleMoodFilter: (mood: MoodId) => void;
   onSelectEntry: (entry: JournalEntry) => void;
 }) {
   const [filterOpen, setFilterOpen] = useState(false);
-  const activeFilterCount = filterTags.length + filterMoods.length;
+  const activeFilterCount = filterTags.length;
 
   return (
     <section className="page unified-width search-page" aria-label="검색">
-      <div className="search-bar-row">
-        <div className="search-box">
-          <Search aria-hidden="true" />
-          <input
-            id="search-input"
-            value={query}
-            onChange={(event) => onQueryChange(event.target.value)}
-            placeholder="본문, 날짜로 검색"
-            aria-label="일기 검색"
-          />
+      <div className={`search-control ${filterOpen ? "is-open" : ""}`}>
+        <div className="search-bar-row">
+          <div className="search-box">
+            <Search aria-hidden="true" />
+            <input
+              id="search-input"
+              value={query}
+              onChange={(event) => onQueryChange(event.target.value)}
+              placeholder="본문, 날짜로 검색"
+              aria-label="일기 검색"
+            />
+          </div>
+          <button
+            className={`filter-toggle ${filterOpen || activeFilterCount > 0 ? "is-active" : ""}`}
+            type="button"
+            onClick={() => setFilterOpen((prev) => !prev)}
+            aria-label="필터"
+          >
+            <SlidersHorizontal aria-hidden="true" />
+            {activeFilterCount > 0 ? <span className="filter-badge">{activeFilterCount}</span> : null}
+          </button>
         </div>
-        <button
-          className={`filter-toggle ${filterOpen || activeFilterCount > 0 ? "is-active" : ""}`}
-          type="button"
-          onClick={() => setFilterOpen((prev) => !prev)}
-          aria-label="필터"
-        >
-          <SlidersHorizontal aria-hidden="true" />
-          {activeFilterCount > 0 ? <span className="filter-badge">{activeFilterCount}</span> : null}
-        </button>
-      </div>
 
-      {filterOpen ? (
-        <div className="filter-panel">
-          {allTags.length > 0 ? (
+        {filterOpen && allTags.length > 0 ? (
+          <div className="filter-panel">
             <div className="filter-chips">
               {allTags.map((tag) => (
                 <button
@@ -1165,25 +1544,9 @@ function SearchView({
                 </button>
               ))}
             </div>
-          ) : null}
-          <div className="filter-chips mood-filter-row">
-            {MOODS.map((mood) => {
-              const Icon = mood.icon;
-              return (
-                <button
-                  key={mood.id}
-                  className={`filter-chip mood-filter-chip ${mood.tone} ${filterMoods.includes(mood.id) ? "is-selected" : ""}`}
-                  type="button"
-                  onClick={() => onToggleMoodFilter(mood.id)}
-                  aria-label={mood.label}
-                >
-                  <Icon aria-hidden="true" />
-                </button>
-              );
-            })}
           </div>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
 
       <div className="result-list">
         {results.length ? (
@@ -1236,22 +1599,36 @@ function MobileNav({ current, onChange }: { current: ViewId; onChange: (view: Vi
 
 function MobileAccountButton({
   user,
-  isActive,
+  isProfileActive,
   onClick,
 }: {
   user: User;
-  isActive: boolean;
+  isProfileActive: boolean;
   onClick: () => void;
 }) {
   return (
     <button
-      className={`mobile-account-button ${isActive ? "is-active" : ""}`}
+      className={`mobile-account-button ${isProfileActive ? "is-active" : ""}`}
       type="button"
       onClick={onClick}
       aria-label="나의 페이지"
       title={user.email ?? "나의 페이지"}
     >
       {user.photoURL ? <img src={user.photoURL} alt="" /> : <Cloud aria-hidden="true" />}
+    </button>
+  );
+}
+
+function MobileThemeButton({
+  theme,
+  onClick,
+}: {
+  theme: AppSettings["theme"];
+  onClick: () => void;
+}) {
+  return (
+    <button className="mobile-theme-button" type="button" onClick={onClick} aria-label="테마 전환" title="테마 전환">
+      {theme === "light" ? <Moon aria-hidden="true" /> : <Sun aria-hidden="true" />}
     </button>
   );
 }
