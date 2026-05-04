@@ -1572,20 +1572,26 @@ function SearchView({
           </button>
         </div>
 
-        {filterOpen && allTags.length > 0 ? (
+        {filterOpen ? (
           <div className="filter-panel">
-            <div className="filter-chips">
-              {allTags.map((tag) => (
-                <button
-                  key={tag}
-                  className={`filter-chip ${filterTags.includes(tag) ? "is-selected" : ""}`}
-                  type="button"
-                  onClick={() => onToggleTagFilter(tag)}
-                >
-                  #{tag}
-                </button>
-              ))}
-            </div>
+            {allTags.length > 0 ? (
+              <div className="filter-chips">
+                {allTags.map((tag) => (
+                  <button
+                    key={tag}
+                    className={`filter-chip ${filterTags.includes(tag) ? "is-selected" : ""}`}
+                    type="button"
+                    onClick={() => onToggleTagFilter(tag)}
+                  >
+                    #{tag}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <small style={{ color: "var(--muted)", fontSize: 12 }}>
+                일기에 태그를 추가하면 여기서 필터로 사용할 수 있어요.
+              </small>
+            )}
           </div>
         ) : null}
       </div>
