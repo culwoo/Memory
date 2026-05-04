@@ -386,34 +386,6 @@ function App() {
   }, []);
 
 
-  const flushDraftToEntries = useCallback(() => {
-    const current = draftRef.current;
-    if (!hasEntryContent(current)) return;
-    const now = new Date().toISOString();
-    const flushed: JournalEntry = {
-      ...current,
-      updatedAt: now,
-      version: current.version + 1,
-    };
-    draftRef.current = flushed;
-    setDraft(flushed);
-    setEntries((previous) => {
-      const withoutCurrent = previous.filter(
-        (item) => item.id !== flushed.id && item.date !== flushed.date
-      );
-      return sortEntries([flushed, ...withoutCurrent]);
-    });
-    setDirty(false);
-    setSaveState("saved");
-    void saveEntry(flushed).then(() => {
-      clearDraftShadow(syncUserRef.current?.uid, flushed.id);
-    });
-    if (syncUserRef.current) {
-      void pushEntryToCloud(syncUserRef.current.uid, flushed).catch((error) => {
-        setSyncError(syncErrorMessage(error));
-      });
-    }
-  }, []);
 
   const commitDraft = useCallback((updater: (entry: JournalEntry) => JournalEntry): JournalEntry => {
     const nextDraft = updater(draftRef.current);
@@ -445,16 +417,19 @@ function App() {
         version: sourceEntry.version + 1,
       };
 
+      // Immediately update React state so calendar/search see the entry
+      // even before the async IDB write completes.
+      draftRef.current = nextEntry;
+      setDraft(nextEntry);
+      setEntries((previous) => {
+        const withoutCurrent = previous.filter((item) => item.id !== nextEntry.id && item.date !== nextEntry.date);
+        return sortEntries([nextEntry, ...withoutCurrent]);
+      });
+      setDirty(false);
+
       try {
         await saveEntry(nextEntry);
         clearDraftShadow(syncUserRef.current?.uid, nextEntry.id);
-        draftRef.current = nextEntry;
-        setDraft(nextEntry);
-        setEntries((previous) => {
-          const withoutCurrent = previous.filter((item) => item.id !== nextEntry.id && item.date !== nextEntry.date);
-          return sortEntries([nextEntry, ...withoutCurrent]);
-        });
-        setDirty(false);
         setSaveState("saved");
         if (syncUserRef.current) {
           void pushEntryToCloud(syncUserRef.current.uid, nextEntry).catch((error) => {
@@ -471,13 +446,13 @@ function App() {
   const loadDraftForDate = useCallback(
     (date: string, nextView: ViewId = "today") => {
       if (draftRef.current.date === date) {
-        if (dirtyRef.current) flushDraftToEntries();
+        if (dirtyRef.current) void persistDraft();
         setView(nextView);
         return;
       }
 
       if (dirtyRef.current) {
-        flushDraftToEntries();
+        void persistDraft();
       }
 
       const existing = entryByDate.get(date);
@@ -489,17 +464,17 @@ function App() {
       setSaveState(existing ? "saved" : "idle");
       setView(nextView);
     },
-    [entryByDate, flushDraftToEntries]
+    [entryByDate, persistDraft]
   );
 
   const handleViewChange = useCallback(
     (nextView: ViewId) => {
       if (view === "today" && nextView !== "today" && dirtyRef.current) {
-        flushDraftToEntries();
+        void persistDraft();
       }
       setView(nextView);
     },
-    [view, flushDraftToEntries]
+    [view, persistDraft]
   );
 
   useEffect(() => {
