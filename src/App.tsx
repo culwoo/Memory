@@ -342,13 +342,7 @@ function App() {
   const syncUserRef = useRef<User | null>(syncUser);
   const tagLibraryRef = useRef<string[]>(tagLibrary);
 
-  const entryByDate = useMemo(() => {
-    const map = new Map(entries.map((entry) => [entry.date, entry]));
-    if (hasEntryContent(draft)) {
-      map.set(draft.date, draft);
-    }
-    return map;
-  }, [entries, draft]);
+  const entryByDate = useMemo(() => new Map(entries.map((entry) => [entry.date, entry])), [entries]);
   const activeMood = MOODS.find((mood) => mood.id === draft.mood);
 
   const resetVisibleJournal = useCallback((date: string = todayKey()) => {
@@ -391,6 +385,35 @@ function App() {
     });
   }, []);
 
+
+  const flushDraftToEntries = useCallback(() => {
+    const current = draftRef.current;
+    if (!hasEntryContent(current)) return;
+    const now = new Date().toISOString();
+    const flushed: JournalEntry = {
+      ...current,
+      updatedAt: now,
+      version: current.version + 1,
+    };
+    draftRef.current = flushed;
+    setDraft(flushed);
+    setEntries((previous) => {
+      const withoutCurrent = previous.filter(
+        (item) => item.id !== flushed.id && item.date !== flushed.date
+      );
+      return sortEntries([flushed, ...withoutCurrent]);
+    });
+    setDirty(false);
+    setSaveState("saved");
+    void saveEntry(flushed).then(() => {
+      clearDraftShadow(syncUserRef.current?.uid, flushed.id);
+    });
+    if (syncUserRef.current) {
+      void pushEntryToCloud(syncUserRef.current.uid, flushed).catch((error) => {
+        setSyncError(syncErrorMessage(error));
+      });
+    }
+  }, []);
 
   const commitDraft = useCallback((updater: (entry: JournalEntry) => JournalEntry): JournalEntry => {
     const nextDraft = updater(draftRef.current);
@@ -448,12 +471,13 @@ function App() {
   const loadDraftForDate = useCallback(
     (date: string, nextView: ViewId = "today") => {
       if (draftRef.current.date === date) {
+        if (dirtyRef.current) flushDraftToEntries();
         setView(nextView);
         return;
       }
 
       if (dirtyRef.current) {
-        void persistDraft();
+        flushDraftToEntries();
       }
 
       const existing = entryByDate.get(date);
@@ -465,17 +489,17 @@ function App() {
       setSaveState(existing ? "saved" : "idle");
       setView(nextView);
     },
-    [entryByDate, persistDraft]
+    [entryByDate, flushDraftToEntries]
   );
 
   const handleViewChange = useCallback(
     (nextView: ViewId) => {
       if (view === "today" && nextView !== "today" && dirtyRef.current) {
-        void persistDraft();
+        flushDraftToEntries();
       }
       setView(nextView);
     },
-    [view, persistDraft]
+    [view, flushDraftToEntries]
   );
 
   useEffect(() => {
@@ -612,7 +636,25 @@ function App() {
             if (!active) return;
 
             const nextVisibleEntries = sortEntries(merged.filter((entry) => !entry.deletedAt));
-            setEntries(nextVisibleEntries);
+
+            // Protect the current draft: if it has content that isn't yet
+            // reflected in the merged result, inject it so the calendar
+            // and search views never lose a locally-written entry.
+            const currentDraft = draftRef.current;
+            if (hasEntryContent(currentDraft)) {
+              const alreadyIncluded = nextVisibleEntries.some(
+                (e) => e.date === currentDraft.date && e.updatedAt >= currentDraft.updatedAt
+              );
+              if (!alreadyIncluded) {
+                const withoutDraftDate = nextVisibleEntries.filter((e) => e.date !== currentDraft.date);
+                setEntries(sortEntries([currentDraft, ...withoutDraftDate]));
+              } else {
+                setEntries(nextVisibleEntries);
+              }
+            } else {
+              setEntries(nextVisibleEntries);
+            }
+
             setDraft((previous) => {
               if (dirtyRef.current) return previous;
               const nextDraft = nextVisibleEntries.find((entry) => entry.date === currentDateRef.current) ?? previous;
@@ -655,7 +697,7 @@ function App() {
     }, 650);
 
     return () => window.clearTimeout(timer);
-  }, [dirty, persistDraft, settings.autoSaveEnabled]);
+  }, [dirty, draft, persistDraft, settings.autoSaveEnabled]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query.trim().toLowerCase()), 220);
